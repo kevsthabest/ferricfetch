@@ -22,7 +22,7 @@
 unsigned short __cdecl cpu_family_ladder(void);
 unsigned short __cdecl cpu_has_cpuid(void);
 void __cdecl cpu_cpuid(unsigned long leaf, unsigned long __far *regs);
-void __cdecl xms_query_free_kb(unsigned int entry_off, unsigned int entry_seg,
+int __cdecl xms_query_free_kb(unsigned int entry_off, unsigned int entry_seg,
                        unsigned int *total_kb, unsigned int *largest_kb);
 
 /* From cpu.asm: an INT 24h handler that answers "Fail" to every
@@ -246,9 +246,10 @@ void mod_memory(void)
         unsigned int total = 0, largest = 0;
         r.x.ax = 0x4310;
         int86x(0x2F, &r, &r, &s);
-        xms_query_free_kb(r.x.bx, s.es, &total, &largest);
-        xms_kb = total;
-        have_xms = 1;
+        if (xms_query_free_kb(r.x.bx, s.es, &total, &largest)) {
+            xms_kb = total;
+            have_xms = 1;
+        }
     }
 
     /* EMS: an expanded-memory manager installs a device whose header
@@ -375,7 +376,7 @@ void mod_physdisk(void)
         static unsigned char edd[48];
         char buf[FF_VAL_MAX];
         char size_s[16];
-        unsigned long sectors;
+        unsigned long sectors_lo, sectors_hi;
         unsigned int bps;
         /* EDD installation check first: AH=41h with the 55AAh
          * signature. A BIOS without EDD clears nothing and sets
@@ -393,11 +394,28 @@ void mod_physdisk(void)
         r.x.si = (unsigned int)edd;
         int86x(0x13, &r, &r, &s);
         if (r.x.cflag) continue;
-        sectors = *(unsigned long *)(edd + 16);
+        sectors_lo = *(unsigned long *)(edd + 16);
+        sectors_hi = *(unsigned long *)(edd + 20);
         bps = *(unsigned int *)(edd + 24);
-        if (sectors == 0 || bps == 0) continue;
-        ff_fmt_bytes(size_s, sectors * (unsigned long)bps);
-        sprintf(buf, "Drive %d: %s (%lu sectors x %u)", d, size_s, sectors, bps);
+        if ((sectors_lo == 0 && sectors_hi == 0) || bps == 0) continue;
+        /* Work in KiB (or GiB for >2 TiB disks) so drives >= 4 GiB
+         * never overflow 32-bit byte counts. */
+        if (sectors_hi == 0) {
+            unsigned long kb;
+            if (bps >= 512 && (bps % 512) == 0) {
+                unsigned long mult = (unsigned long)(bps / 512);
+                kb = (sectors_lo / 2UL) * mult + ((sectors_lo & 1UL) * mult) / 2UL;
+            } else {
+                kb = (sectors_lo / 1024UL) * (unsigned long)bps +
+                     ((sectors_lo % 1024UL) * (unsigned long)bps) / 1024UL;
+            }
+            ff_fmt_kb(size_s, kb);
+            snprintf(buf, sizeof(buf), "Drive %d: %s (%lu sectors x %u)", d, size_s, sectors_lo, bps);
+        } else {
+            unsigned long gb = (sectors_hi * 2048UL) + (sectors_lo >> 21);
+            if (bps > 512) gb *= (unsigned long)(bps / 512);
+            snprintf(buf, sizeof(buf), "Drive %d: %lu GB (%u B/sector)", d, gb, bps);
+        }
         ff_add("Physical Disk", buf);
     }
 }
@@ -408,10 +426,11 @@ void mod_physdisk(void)
 
 void mod_uptime(void)
 {
-    /* The BIOS tick counter at 0040:006C runs at 18.2 Hz and wraps
-     * at midnight; the byte at 0040:0070 counts the wraps. Read the
-     * pair twice and keep a consistent sample, because a wrap could
-     * land between the two reads. */
+    /* The BIOS tick counter at 0040:006C runs at 18.2 Hz (ticks since
+     * midnight; DOS has no monotonic boot-tick counter without a TSR)
+     * and sets 0040:0070 on midnight rollover. Read the pair twice and
+     * require both fields to match so neither a rollover nor a torn
+     * 32-bit read across IRQ0 can corrupt the sample. */
     unsigned long ticks, ticks2;
     unsigned int days, days2;
     unsigned long seconds, d, h, m;
@@ -421,15 +440,14 @@ void mod_uptime(void)
         ticks = peekd(0x40, 0x6C);
         days2 = peekb(0x40, 0x70);
         ticks2 = peekd(0x40, 0x6C);
-    } while (days != days2);
-    (void)ticks2;
+    } while (days != days2 || ticks != ticks2);
     seconds = (ticks * 10UL) / 182UL;   /* 18.2 ticks per second */
     d = days + seconds / 86400UL;
     h = (seconds % 86400UL) / 3600UL;
     m = (seconds % 3600UL) / 60UL;
-    if (d > 0) sprintf(buf, "%lud %luh %lum", d, h, m);
-    else if (h > 0) sprintf(buf, "%luh %lum", h, m);
-    else sprintf(buf, "%lum", m);
+    if (d > 0) snprintf(buf, sizeof(buf), "%lud %luh %lum", d, h, m);
+    else if (h > 0) snprintf(buf, sizeof(buf), "%luh %lum", h, m);
+    else snprintf(buf, sizeof(buf), "%lum", m);
     ff_add("Uptime", buf);
 }
 
@@ -444,7 +462,7 @@ void mod_datetime(void)
         unsigned int mo = r.h.dh, da = r.h.dl;
         r.h.ah = 0x2C;
         int86(0x21, &r, &r);
-        sprintf(buf, "%04u-%02u-%02u %02u:%02u:%02u", y, mo, da, r.h.ch, r.h.cl, r.h.dh);
+        snprintf(buf, sizeof(buf), "%04u-%02u-%02u %02u:%02u:%02u", y, mo, da, r.h.ch, r.h.cl, r.h.dh);
     }
     ff_add("DateTime", buf);
 }
@@ -465,28 +483,30 @@ void mod_locale(void)
     r.x.di = (unsigned int)info;
     s.es = s.ds;
     int86x(0x21, &r, &r, &s);
-    if (r.x.cflag) return;
-    /* Extended country information layout: byte 0 is the info type,
+    if (r.x.cflag || info[0] != 0x01) return;
+    /* Extended country information layout: byte 0 is the info type (1),
      * then a size word, then the country ID and codepage words. */
     country = *(unsigned int *)(info + 3);
     codepage = *(unsigned int *)(info + 5);
+    if (country == 0) return;
     r.x.ax = 0x6601;
     int86(0x21, &r, &r);
     if (!r.x.cflag && r.x.bx != 0) codepage = r.x.bx;
-    sprintf(buf, "Country %u, codepage %u", country, codepage);
+    snprintf(buf, sizeof(buf), "Country %u, codepage %u", country, codepage);
     ff_add("Locale", buf);
 }
 
 void mod_title(void)
 {
-    const char *user = ff_getenv("USERNAME");
-    const char *host = ff_getenv("COMPUTERNAME");
+    char user[48], host[48];
     char buf[FF_VAL_MAX];
-    if (!user) user = ff_getenv("USER");
-    if (!host) host = ff_getenv("HOSTNAME");
-    if (!user && !host) return;
-    if (user && host) sprintf(buf, "%s@%s", user, host);
-    else sprintf(buf, "%s", user ? user : host);
+    int have_user = ff_getenv_buf("USERNAME", user, sizeof(user)) ||
+                    ff_getenv_buf("USER", user, sizeof(user));
+    int have_host = ff_getenv_buf("COMPUTERNAME", host, sizeof(host)) ||
+                    ff_getenv_buf("HOSTNAME", host, sizeof(host));
+    if (!have_user && !have_host) return;
+    if (have_user && have_host) snprintf(buf, sizeof(buf), "%s@%s", user, host);
+    else snprintf(buf, sizeof(buf), "%s", have_user ? user : host);
     ff_add("Title", buf);
 }
 
@@ -498,10 +518,38 @@ void mod_editor(void)
 
 void mod_shell(void)
 {
-    const char *comspec = ff_getenv("COMSPEC");
+    char comspec[80];
     char buf[FF_VAL_MAX];
     const char *base;
-    if (!comspec || !comspec[0]) return;
+    int have_comspec = ff_getenv_buf("COMSPEC", comspec, sizeof(comspec));
+    /* Positive INT 2Fh installation checks for 4DOS (AX=D44Dh -> 44DDh)
+     * and NDOS (AX=E44Dh -> 44EEh): both return major in BL, minor in BH. */
+    {
+        union REGS r;
+        r.x.ax = 0xD44D;
+        r.x.bx = 0x0000;
+        int86(0x2F, &r, &r);
+        if (r.x.ax == 0x44DD) {
+            if (have_comspec)
+                snprintf(buf, sizeof(buf), "%s (4DOS %u.%02u)", comspec, r.h.bl, r.h.bh);
+            else
+                snprintf(buf, sizeof(buf), "4DOS %u.%02u", r.h.bl, r.h.bh);
+            ff_add("Shell", buf);
+            return;
+        }
+        r.x.ax = 0xE44D;
+        r.x.bx = 0x0000;
+        int86(0x2F, &r, &r);
+        if (r.x.ax == 0x44EE) {
+            if (have_comspec)
+                snprintf(buf, sizeof(buf), "%s (NDOS %u.%02u)", comspec, r.h.bl, r.h.bh);
+            else
+                snprintf(buf, sizeof(buf), "NDOS %u.%02u", r.h.bl, r.h.bh);
+            ff_add("Shell", buf);
+            return;
+        }
+    }
+    if (!have_comspec || !comspec[0]) return;
     base = comspec;
     {
         const char *p = comspec;
@@ -532,9 +580,9 @@ void mod_shell(void)
             }
             fclose(f);
         }
-        sprintf(buf, "%s%s", comspec, is_freecom ? " (FreeCOM)" : "");
+        snprintf(buf, sizeof(buf), "%s%s", comspec, is_freecom ? " (FreeCOM)" : "");
     } else {
-        sprintf(buf, "%s", comspec);
+        snprintf(buf, sizeof(buf), "%s", comspec);
     }
     ff_add("Shell", buf);
 }
@@ -544,7 +592,7 @@ void mod_bootmgr(void)
     const char *cfg = ff_getenv("CONFIG");
     char buf[FF_VAL_MAX];
     if (!cfg || !cfg[0]) return;
-    sprintf(buf, "FreeDOS menu profile %s", cfg);
+    snprintf(buf, sizeof(buf), "FreeDOS menu profile %s", cfg);
     ff_add("Bootmgr", buf);
 }
 
@@ -556,26 +604,29 @@ void mod_processes(void)
 {
     /* Walk the memory control block chain from its head, which the
      * List of Lists points at (INT 21h AH=52h, ES:[BX-2]). Every
-     * resident program owns an MCB whose owner field is its PSP
-     * segment; DOS 4+ also stores the program's name in the MCB.
-     * Names are collected, not trusted blindly: an MCB that fails
-     * the signature or PSP checks ends the walk, because a corrupt
+     * resident program's primary PSP MCB has owner == mcb_seg + 1;
+     * DOS 4+ also stores the program's name in that MCB. Names are
+     * collected, not trusted blindly: an MCB that fails the signature,
+     * monotonicity or PSP checks ends the walk, because a corrupt
      * chain says nothing worth printing. */
     union REGS r;
     struct SREGS s;
     unsigned int mcb_seg;
     char names[FF_VAL_MAX];
     int count = 0;
+    int steps = 0;
     names[0] = 0;
     r.h.ah = 0x52;
     int86x(0x21, &r, &r, &s);
     mcb_seg = peekw(s.es, r.x.bx - 2);
-    while (mcb_seg != 0 && mcb_seg != 0xFFFF) {
+    while (mcb_seg != 0 && mcb_seg != 0xFFFF && steps < 512) {
         unsigned char sig = peekb(mcb_seg, 0);
         unsigned int owner = peekw(mcb_seg, 1);
         unsigned int size_paras = peekw(mcb_seg, 3);
+        unsigned long next_seg;
+        steps++;
         if (sig != 'M' && sig != 'Z') break;
-        if (owner != 0 && owner != 8 && owner != _psp) {
+        if (owner == mcb_seg + 1 && owner != _psp) {
             /* PSP signature check: a real PSP starts with INT 20h. */
             if (peekb(owner, 0) == 0xCD && peekb(owner, 1) == 0x20) {
                 char nm[9];
@@ -596,13 +647,16 @@ void mod_processes(void)
             }
         }
         if (sig == 'Z') break;
-        mcb_seg = mcb_seg + size_paras + 1;
+        next_seg = (unsigned long)mcb_seg + (unsigned long)size_paras + 1UL;
+        if (next_seg > 0xFFFFUL || next_seg <= (unsigned long)mcb_seg) break;
+        mcb_seg = (unsigned int)next_seg;
     }
     if (count == 0) return;
     if (count > 6) {
         char extra[24];
-        sprintf(extra, ", +%d more", count - 6);
-        strcat(names, extra);
+        snprintf(extra, sizeof(extra), ", +%d more", count - 6);
+        if (strlen(names) + strlen(extra) < sizeof(names))
+            strcat(names, extra);
     }
     ff_add("Processes", names);
 }

@@ -20,7 +20,7 @@
  * calls are made in assembly. Both are gated on the CPU ladder -
  * they contain 386 instructions, and a PCI machine is never older. */
 unsigned short __cdecl cpu_family_ladder(void);
-unsigned long __cdecl pci_bios_present(unsigned int *ok);
+unsigned long __cdecl pci_bios_present(unsigned int *ok, unsigned char *last_bus);
 unsigned long __cdecl pci_bios_read(unsigned int bus_devfn, unsigned int off, unsigned int *ok);
 
 static unsigned char peekb2(unsigned int seg, unsigned int off)
@@ -109,14 +109,28 @@ static const char *pci_class_name(unsigned char cls)
 }
 
 /* PCI BIOS presence, proven by the installation check: AX=B101h
- * returns EDX=' PCI' and carry clear when a PCI BIOS exists. */
+ * returns EDX=' PCI', CL=last PCI bus number, and carry clear when
+ * a PCI BIOS exists. Result is cached so repeat probes don't re-enter
+ * INT 1Ah. */
+static int pci_probed = 0;
+static int pci_present = 0;
+static unsigned char pci_last_bus = 0;
+
 static int pci_bios_ok(void)
 {
-    unsigned int ok = 0;
-    unsigned long sig;
-    if (cpu_family_ladder() < 3) return 0;
-    sig = pci_bios_present(&ok);
-    return ok && sig == 0x20494350UL;   /* ' PCI' */
+    if (!pci_probed) {
+        unsigned int ok = 0;
+        unsigned char last = 0;
+        pci_probed = 1;
+        if (cpu_family_ladder() >= 3) {
+            unsigned long sig = pci_bios_present(&ok, &last);
+            if (ok && sig == 0x20494350UL) {    /* ' PCI' */
+                pci_present = 1;
+                pci_last_bus = last;
+            }
+        }
+    }
+    return pci_present;
 }
 
 static unsigned long pci_read(unsigned char bus, unsigned char devfn, unsigned char off)
@@ -131,15 +145,13 @@ static unsigned long pci_read(unsigned char bus, unsigned char devfn, unsigned c
 }
 
 /* Find the first device of a given class. Returns 1 and fills the
- * IDs when found. The scan is bounded (256 buses x 32 slots x 8
- * functions is the architectural maximum; real machines answer in
- * the first handful, and absent slots return FFFFh immediately). */
+ * IDs when found. Bounded by the last bus reported by INT 1Ah B101h. */
 static int pci_find_class(unsigned char want_cls, unsigned int *vid, unsigned int *did,
                           unsigned char *cls_out, unsigned char *sub_out)
 {
     unsigned int bus;
     if (!pci_bios_ok()) return 0;
-    for (bus = 0; bus < 256; bus++) {
+    for (bus = 0; bus <= (unsigned int)pci_last_bus; bus++) {
         unsigned int slot;
         for (slot = 0; slot < 32; slot++) {
             unsigned int fn;
@@ -231,17 +243,19 @@ void mod_gpu(void)
 {
     char buf[FF_VAL_MAX];
     char mem_s[16];
-    unsigned int vid, did;
-    unsigned char cls, sub;
+    unsigned int vid = 0, did = 0;
+    unsigned char cls = 0, sub = 0;
     const char *name = NULL;
+    int have_pci;
     vbe_probe();
-    if (pci_find_class(0x03, &vid, &did, &cls, &sub)) name = pci_lookup(vid, did);
+    have_pci = pci_find_class(0x03, &vid, &did, &cls, &sub);
+    if (have_pci) name = pci_lookup(vid, did);
     if (name) {
         if (vbe_ok) {
             ff_fmt_kb(mem_s, (unsigned long)vbe_mem_64k * 64UL);
-            sprintf(buf, "%s, VBE %u.%u, %s VRAM", name, vbe_version >> 8, vbe_version & 0xFF, mem_s);
+            snprintf(buf, sizeof(buf), "%s, VBE %u.%u, %s VRAM", name, vbe_version >> 8, vbe_version & 0xFF, mem_s);
         } else {
-            sprintf(buf, "%s", name);
+            snprintf(buf, sizeof(buf), "%s", name);
         }
         ff_add("GPU", buf);
         return;
@@ -249,14 +263,14 @@ void mod_gpu(void)
     if (vbe_ok) {
         ff_fmt_kb(mem_s, (unsigned long)vbe_mem_64k * 64UL);
         if (vbe_oem[0])
-            sprintf(buf, "%s, VBE %u.%u, %s VRAM", vbe_oem, vbe_version >> 8, vbe_version & 0xFF, mem_s);
+            snprintf(buf, sizeof(buf), "%s, VBE %u.%u, %s VRAM", vbe_oem, vbe_version >> 8, vbe_version & 0xFF, mem_s);
         else
-            sprintf(buf, "VBE %u.%u adapter, %s VRAM", vbe_version >> 8, vbe_version & 0xFF, mem_s);
+            snprintf(buf, sizeof(buf), "VBE %u.%u adapter, %s VRAM", vbe_version >> 8, vbe_version & 0xFF, mem_s);
         ff_add("GPU", buf);
         return;
     }
-    if (pci_find_class(0x03, &vid, &did, &cls, &sub)) {
-        sprintf(buf, "%s %04X:%04X", pci_class_name(cls), vid, did);
+    if (have_pci) {
+        snprintf(buf, sizeof(buf), "%s %04X:%04X", pci_class_name(cls), vid, did);
         ff_add("GPU", buf);
     }
 }
@@ -315,6 +329,27 @@ static unsigned char smb_peek(unsigned long addr);
 static void smb_string(unsigned long str_area, unsigned int idx, char *out, size_t cap);
 static unsigned long smb_find(unsigned char type, int which);
 
+static int rom_date_at(unsigned int off, char *out)
+{
+    unsigned char b[10];
+    int k, mon, day, n = 8;
+    for (k = 0; k < 8; k++) b[k] = peekb2(0xF000, off + k);
+    if (!(b[0] >= '0' && b[0] <= '1' && b[1] >= '0' && b[1] <= '9' && b[2] == '/' &&
+          b[3] >= '0' && b[3] <= '3' && b[4] >= '0' && b[4] <= '9' && b[5] == '/' &&
+          b[6] >= '0' && b[6] <= '9' && b[7] >= '0' && b[7] <= '9'))
+        return 0;
+    mon = (b[0] - '0') * 10 + (b[1] - '0');
+    day = (b[3] - '0') * 10 + (b[4] - '0');
+    if (mon < 1 || mon > 12 || day < 1 || day > 31) return 0;
+    if (off <= 0xFFF5U &&
+        peekb2(0xF000, off + 8) >= '0' && peekb2(0xF000, off + 8) <= '9' &&
+        peekb2(0xF000, off + 9) >= '0' && peekb2(0xF000, off + 9) <= '9')
+        n = 10;
+    for (k = 0; k < n; k++) out[k] = (char)peekb2(0xF000, off + k);
+    out[n] = 0;
+    return 1;
+}
+
 void mod_bios(void)
 {
     /* SMBIOS Type 0 is the authoritative source when the firmware
@@ -330,19 +365,25 @@ void mod_bios(void)
             smb_string(strings, smb_peek(t0 + 8), dat, sizeof(dat));
             if (ven[0] || ver[0] || dat[0]) {
                 buf[0] = 0;
-                if (ven[0]) { strcpy(buf, ven); strcat(buf, " BIOS"); }
-                if (ver[0]) { if (buf[0]) strcat(buf, " "); strcat(buf, ver); }
-                if (dat[0]) { if (buf[0]) strcat(buf, ", "); strcat(buf, dat); }
+                if (ven[0]) { snprintf(buf, sizeof(buf), "%s BIOS", ven); }
+                if (ver[0]) {
+                    size_t l = strlen(buf);
+                    snprintf(buf + l, sizeof(buf) - l, "%s%s", l ? " " : "", ver);
+                }
+                if (dat[0]) {
+                    size_t l = strlen(buf);
+                    snprintf(buf + l, sizeof(buf) - l, "%s%s", l ? ", " : "", dat);
+                }
                 ff_add("BIOS", buf);
                 return;
             }
         }
     }
-    /* Pre-SMBIOS fallback: the release date is an ASCII MM/DD/YY(YY)
-     * pattern somewhere in the F000 segment, and vendor names are
-     * recognised only at non-letter boundaries - a bare substring
-     * search once "found" a two-letter vendor inside unrelated ROM
-     * bytes and printed it as fact. */
+    /* Pre-SMBIOS fallback: check the standard IBM PC BIOS release date
+     * at F000:FFF5 first, then scan F000 for an MM/DD/YY(YY) pattern.
+     * Vendor names are recognised only at non-letter boundaries - a bare
+     * substring search once "found" a two-letter vendor inside unrelated
+     * ROM bytes and printed it as fact. */
     {
         static const char *vendors[] = { "SeaBIOS", "Award", "Phoenix", "American Megatrends", "AMI", "IBM", "Dell", "Toshiba", "Compaq", NULL };
         char date[12];
@@ -350,22 +391,10 @@ void mod_bios(void)
         unsigned int off;
         int i;
         date[0] = 0;
-        for (off = 0; off < 0xFFF0 && !date[0]; off++) {
-            unsigned char c0 = peekb2(0xF000, off);
-            if (c0 >= '0' && c0 <= '1') {
-                unsigned char b[10];
-                int ok = 1, k;
-                for (k = 0; k < 8; k++) b[k] = peekb2(0xF000, off + k);
-                if (!(b[0] >= '0' && b[0] <= '9' && b[1] >= '0' && b[1] <= '9' && b[2] == '/' &&
-                      b[3] >= '0' && b[3] <= '9' && b[4] >= '0' && b[4] <= '9' && b[5] == '/' &&
-                      b[6] >= '0' && b[6] <= '9' && b[7] >= '0' && b[7] <= '9')) ok = 0;
-                if (ok) {
-                    int n = 8;
-                    if (peekb2(0xF000, off + 8) >= '0' && peekb2(0xF000, off + 8) <= '9' &&
-                        peekb2(0xF000, off + 9) >= '0' && peekb2(0xF000, off + 9) <= '9') n = 10;
-                    for (k = 0; k < n; k++) date[k] = (char)peekb2(0xF000, off + k);
-                    date[n] = 0;
-                }
+        if (!rom_date_at(0xFFF5, date)) {
+            for (off = 0; off < 0xFFF0 && !date[0]; off++) {
+                if (peekb2(0xF000, off) >= '0' && peekb2(0xF000, off) <= '1')
+                    rom_date_at(off, date);
             }
         }
         for (i = 0; vendors[i] && !vendor; i++) {
@@ -388,9 +417,9 @@ void mod_bios(void)
         }
         if (date[0] || vendor) {
             char buf[FF_VAL_MAX];
-            if (vendor && date[0]) sprintf(buf, "%s BIOS, %s", vendor, date);
-            else if (vendor) sprintf(buf, "%s BIOS", vendor);
-            else sprintf(buf, "BIOS dated %s", date);
+            if (vendor && date[0]) snprintf(buf, sizeof(buf), "%s BIOS, %s", vendor, date);
+            else if (vendor) snprintf(buf, sizeof(buf), "%s BIOS", vendor);
+            else snprintf(buf, sizeof(buf), "BIOS dated %s", date);
             ff_add("BIOS", buf);
         }
     }
@@ -399,26 +428,42 @@ void mod_bios(void)
 /* SMBIOS: the _SM_ anchor sits on a 16-byte boundary between
  * F0000h and FFFFFh. Structures are walked by their length fields
  * with a string set after each; every read is bounds-checked against
- * the table length the anchor declares, because a malformed table
- * must degrade to silence, never to a wild read. */
+ * the table length the anchor declares, and tables above 1 MiB are
+ * rejected cleanly since real mode cannot address them without wrapping. */
+static int smbios_probed = 0;
 static unsigned long smbios_addr = 0;
 static unsigned int smbios_len = 0;
 
 static int smbios_locate(void)
 {
     unsigned int off;
-    if (smbios_addr) return 1;
-    for (off = 0; off < 0xFFF0; off += 16) {
+    if (smbios_probed) return smbios_addr != 0;
+    smbios_probed = 1;
+    for (off = 0; off <= 0xFFE0; off += 16) {
         if (peekb2(0xF000, off) == '_' && peekb2(0xF000, off + 1) == 'S' &&
             peekb2(0xF000, off + 2) == 'M' && peekb2(0xF000, off + 3) == '_') {
+            unsigned int ep_len = peekb2(0xF000, off + 5);
             unsigned char csum = 0;
-            int i;
-            for (i = 0; i < 0x1F; i++) csum = (unsigned char)(csum + peekb2(0xF000, off + i));
+            unsigned int i, tlen;
+            unsigned long taddr;
+            if (ep_len < 0x1F || (unsigned long)off + (unsigned long)ep_len > 0x10000UL)
+                continue;
+            for (i = 0; i < ep_len; i++) csum = (unsigned char)(csum + peekb2(0xF000, off + i));
             if (csum != 0) continue;
-            smbios_len = peekw2(0xF000, off + 0x16);
-            smbios_addr = peekw2(0xF000, off + 0x18) | ((unsigned long)peekw2(0xF000, off + 0x1A) << 16);
-            return smbios_addr != 0;
+            if (peekb2(0xF000, off + 0x10) != '_' || peekb2(0xF000, off + 0x11) != 'D' ||
+                peekb2(0xF000, off + 0x12) != 'M' || peekb2(0xF000, off + 0x13) != 'I' ||
+                peekb2(0xF000, off + 0x14) != '_')
+                continue;
+            tlen = peekw2(0xF000, off + 0x16);
+            taddr = peekw2(0xF000, off + 0x18) | ((unsigned long)peekw2(0xF000, off + 0x1A) << 16);
+            /* Real-mode addressing stops at 1 MiB; reject tables in high memory. */
+            if (taddr == 0 || tlen == 0 || taddr >= 0x100000UL || taddr + tlen > 0x100000UL)
+                continue;
+            smbios_len = tlen;
+            smbios_addr = taddr;
+            return 1;
         }
+        if (off == 0xFFE0) break;
     }
     return 0;
 }
@@ -431,21 +476,23 @@ static unsigned char smb_peek(unsigned long addr)
 }
 
 /* Copy string `idx` of the structure whose formatted part starts at
- * `str_area` (the byte right after the formatted section). */
+ * `str_area` (the byte right after the formatted section), bounded
+ * by the SMBIOS table end. */
 static void smb_string(unsigned long str_area, unsigned int idx, char *out, size_t cap)
 {
     unsigned long p = str_area;
+    unsigned long end = smbios_addr + smbios_len;
     unsigned int cur = 1;
     size_t n = 0;
     out[0] = 0;
-    if (idx == 0) return;
+    if (idx == 0 || p >= end) return;
     while (cur < idx) {
-        while (smb_peek(p)) p++;
+        while (p < end && smb_peek(p)) p++;
         p++;
-        if (smb_peek(p) == 0) return;   /* ran off the set */
+        if (p >= end || smb_peek(p) == 0) return;   /* ran off the set */
         cur++;
     }
-    while (smb_peek(p) && n < cap - 1) out[n++] = (char)smb_peek(p++);
+    while (p < end && smb_peek(p) && n < cap - 1) out[n++] = (char)smb_peek(p++);
     out[n] = 0;
 }
 
@@ -460,7 +507,7 @@ static unsigned long smb_find(unsigned char type, int which)
         unsigned char t = smb_peek(p);
         unsigned int len = smb_peek(p + 1);
         unsigned long strings;
-        if (len < 4) return 0;
+        if (len < 4 || p + len > end) return 0;
         strings = p + len;
         if (t == 127) return 0;
         if (t == type) {
@@ -480,12 +527,12 @@ void mod_host(void)
     char mfr[48], prod[48], buf[FF_VAL_MAX];
     if (!smbios_locate()) return;
     t1 = smb_find(1, 0);
-    if (!t1) return;
+    if (!t1 || smb_peek(t1 + 1) < 6) return;
     smb_string(t1 + smb_peek(t1 + 1), smb_peek(t1 + 4), mfr, sizeof(mfr));
     smb_string(t1 + smb_peek(t1 + 1), smb_peek(t1 + 5), prod, sizeof(prod));
     if (!mfr[0] && !prod[0]) return;
-    if (mfr[0] && prod[0]) sprintf(buf, "%s %s", mfr, prod);
-    else sprintf(buf, "%s", mfr[0] ? mfr : prod);
+    if (mfr[0] && prod[0]) snprintf(buf, sizeof(buf), "%s %s", mfr, prod);
+    else snprintf(buf, sizeof(buf), "%s", mfr[0] ? mfr : prod);
     ff_add("Host", buf);
 }
 
@@ -495,39 +542,53 @@ void mod_board(void)
     char prod[48], mfr[48], buf[FF_VAL_MAX];
     if (!smbios_locate()) return;
     t2 = smb_find(2, 0);
-    if (!t2) return;
+    if (!t2 || smb_peek(t2 + 1) < 6) return;
     smb_string(t2 + smb_peek(t2 + 1), smb_peek(t2 + 4), mfr, sizeof(mfr));
     smb_string(t2 + smb_peek(t2 + 1), smb_peek(t2 + 5), prod, sizeof(prod));
     if (!prod[0] && !mfr[0]) return;
-    if (mfr[0] && prod[0]) sprintf(buf, "%s %s", mfr, prod);
-    else sprintf(buf, "%s", prod[0] ? prod : mfr);
+    if (mfr[0] && prod[0]) snprintf(buf, sizeof(buf), "%s %s", mfr, prod);
+    else snprintf(buf, sizeof(buf), "%s", prod[0] ? prod : mfr);
     ff_add("Board", buf);
 }
 
 void mod_physmem(void)
 {
     /* Type 17 structures are one per memory device; the size field
-     * is in MB (bit 15 set means the value is in KB). Summing them
-     * gives the installed total the firmware itself reports, which
-     * is a different - and for a summary, better - figure than the
-     * addressable total DOS can see. */
+     * is in MB (bit 15 set means the value is in KB; 0xFFFF means
+     * unknown; 0x7FFF defers to the 32-bit Extended Size at +0x1C). */
     unsigned long total_kb = 0;
     int i, found = 0;
     char buf[FF_VAL_MAX], s[16];
     if (!smbios_locate()) return;
     for (i = 0; i < 16; i++) {
         unsigned long t = smb_find(17, i);
-        unsigned int size;
+        unsigned int slen, size;
         if (!t) break;
+        slen = smb_peek(t + 1);
+        if (slen < 0x0E) continue;
         size = smb_peek(t + 0x0C) | ((unsigned int)smb_peek(t + 0x0D) << 8);
-        if (size == 0) continue;
+        if (size == 0 || size == 0xFFFF) continue;
+        if (size == 0x7FFF) {
+            if (slen >= 0x20) {
+                unsigned long ext_mb =
+                    (unsigned long)smb_peek(t + 0x1C) |
+                    ((unsigned long)smb_peek(t + 0x1D) << 8) |
+                    ((unsigned long)smb_peek(t + 0x1E) << 16) |
+                    ((unsigned long)(smb_peek(t + 0x1F) & 0x7F) << 24);
+                if (ext_mb > 0 && ext_mb <= 0x003FFFFFUL) {
+                    total_kb += ext_mb * 1024UL;
+                    found = 1;
+                }
+            }
+            continue;
+        }
         found = 1;
         if (size & 0x8000) total_kb += (size & 0x7FFF);
         else total_kb += (unsigned long)size * 1024UL;
     }
     if (!found || total_kb == 0) return;
     ff_fmt_kb(s, total_kb);
-    sprintf(buf, "%s installed (SMBIOS)", s);
+    snprintf(buf, sizeof(buf), "%s installed (SMBIOS)", s);
     ff_add("Physical Memory", buf);
 }
 
@@ -656,8 +717,9 @@ void mod_sound(void)
     /* AdLib detection uses its two timers: program timer 1 to fire,
      * and the status register must show both the flag and the mask
      * pattern. It is the test every tracker of the era used, and it
-     * is read-back based, so a missing card cannot fake it. */
-    {
+     * is read-back based, so a missing card cannot fake it. Skip it
+     * when a Sound Blaster DSP already answered. */
+    if (!sb_found) {
         unsigned char s1, s2;
         outp(0x388, 0x04); outp(0x389, 0x60);   /* reset timers */
         outp(0x388, 0x04); outp(0x389, 0x80);   /* enable IRQ flag */
@@ -674,14 +736,14 @@ void mod_sound(void)
         if (s1 == 0x00 && s2 == 0xC0) adlib_found = 1;
     }
     if (sb_found) {
-        sprintf(buf, "Sound Blaster DSP at %03Xh%s", base, blaster ? " (BLASTER set)" : "");
+        snprintf(buf, sizeof(buf), "Sound Blaster DSP at %03Xh%s", base, blaster ? " (BLASTER set)" : "");
         ff_add("Sound", buf);
     } else if (adlib_found) {
         ff_add("Sound", "AdLib (OPL2) at 388h");
     } else if (blaster) {
         /* The environment claims a card the DSP probe could not
          * confirm; report the claim as a claim, not as hardware. */
-        sprintf(buf, "BLASTER=%s (DSP unconfirmed)", blaster);
+        snprintf(buf, sizeof(buf), "BLASTER=%s (DSP unconfirmed)", blaster);
         ff_add("Sound", buf);
     }
 }

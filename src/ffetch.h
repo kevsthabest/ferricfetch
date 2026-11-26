@@ -38,10 +38,12 @@ struct ff_config {
     int show_logo;          /* draw the ASCII logo beside the lines */
     int clear_screen;       /* clear before drawing (console only) */
     int json;               /* machine-readable output instead */
+    int allow_color;        /* 1 = allow colour on console (default) */
     int use_ansi;           /* filled in after the ANSI probe */
-    int stdout_is_console;  /* filled in after the IOCTL probe */
-    unsigned char color_key;   /* ANSI colour number 0-7 for labels */
-    unsigned char color_logo;  /* ANSI colour number 0-7 for the logo */
+    int use_bios_color;     /* filled in when CON is active without ANSI */
+    int stdout_is_console;  /* filled in after the IOCTL CON probe */
+    unsigned char color_key;   /* colour number 0-7 for labels */
+    unsigned char color_logo;  /* colour number 0-7 for the logo */
     char logo_path[80];     /* empty = built-in logo */
     char save_path[80];     /* empty = no save file */
     /* Module selection: an ordered list of module names chosen by the
@@ -85,7 +87,11 @@ void mod_modules(void);
 
 /* Environment lookup that reads the DOS environment block directly
  * (the C runtime copy is fine too, but this one is guaranteed to be
- * the shell's live block, which is where FreeCOM puts CONFIG). */
+ * the shell's live block, which is where FreeCOM puts CONFIG).
+ * ff_getenv_buf writes into a caller-supplied buffer (safe across
+ * multiple lookups); ff_getenv is a convenience wrapper for a single
+ * immediate read. Name matching is case-insensitive. */
+int ff_getenv_buf(const char *name, char *out, size_t cap);
 const char *ff_getenv(const char *name);
 
 /* Format a KiB count into a short human string ("640 KB", "255.9 MB",

@@ -107,6 +107,10 @@ int ff_ferric_probe(void)
         ff_fst.jlm_count = n;
         for (i = 0; i < n; i++) {
             int off = 0x3D + i * 14;
+            if ((unsigned int)(off + 14) > total) {
+                ff_fst.jlm_count = i;
+                break;
+            }
             ff_fst.jlm[i].ddb_id = fst_w(off);
             memcpy(ff_fst.jlm[i].name, fst_buf + off + 2, 12);
             ff_fst.jlm[i].name[12] = 0;
@@ -119,7 +123,7 @@ void mod_ferric(void)
 {
     char buf[FF_VAL_MAX];
     if (!ff_ferric_probe()) return;
-    sprintf(buf, "Resident core (DDB FD01), ABI v%u", ff_ferric_abi);
+    snprintf(buf, sizeof(buf), "Resident core (DDB FD01), ABI v%u", ff_ferric_abi);
     ff_add("Ferric", buf);
 }
 
@@ -130,21 +134,21 @@ void mod_wifi(void)
     if (!ff_fst.answered || !ff_fst.wifi_present) return;
     if (ff_fst.wifi_connected) {
         if (ff_fst.ssid[0])
-            sprintf(buf, "Associated to \"%s\", ch %u, BSSID %02X:%02X:%02X:%02X:%02X:%02X",
-                    ff_fst.ssid, ff_fst.channel,
-                    ff_fst.bssid[0], ff_fst.bssid[1], ff_fst.bssid[2],
-                    ff_fst.bssid[3], ff_fst.bssid[4], ff_fst.bssid[5]);
+            snprintf(buf, sizeof(buf), "Associated to \"%s\", ch %u, BSSID %02X:%02X:%02X:%02X:%02X:%02X",
+                     ff_fst.ssid, ff_fst.channel,
+                     ff_fst.bssid[0], ff_fst.bssid[1], ff_fst.bssid[2],
+                     ff_fst.bssid[3], ff_fst.bssid[4], ff_fst.bssid[5]);
         else
-            sprintf(buf, "Associated, ch %u, BSSID %02X:%02X:%02X:%02X:%02X:%02X",
-                    ff_fst.channel,
-                    ff_fst.bssid[0], ff_fst.bssid[1], ff_fst.bssid[2],
-                    ff_fst.bssid[3], ff_fst.bssid[4], ff_fst.bssid[5]);
+            snprintf(buf, sizeof(buf), "Associated, ch %u, BSSID %02X:%02X:%02X:%02X:%02X:%02X",
+                     ff_fst.channel,
+                     ff_fst.bssid[0], ff_fst.bssid[1], ff_fst.bssid[2],
+                     ff_fst.bssid[3], ff_fst.bssid[4], ff_fst.bssid[5]);
         ff_add("Wi-Fi", buf);
     } else {
         ff_add("Wi-Fi", "Present, not associated");
     }
     if (ff_fst.ip_valid) {
-        sprintf(buf, "%u.%u.%u.%u", ff_fst.ip[0], ff_fst.ip[1], ff_fst.ip[2], ff_fst.ip[3]);
+        snprintf(buf, sizeof(buf), "%u.%u.%u.%u", ff_fst.ip[0], ff_fst.ip[1], ff_fst.ip[2], ff_fst.ip[3]);
         ff_add("Stack IP", buf);
     }
 }
@@ -152,14 +156,26 @@ void mod_wifi(void)
 void mod_modules(void)
 {
     char buf[FF_VAL_MAX];
+    size_t pos = 0;
     int i;
     if (!ff_ferric_probe()) return;
     if (!ff_fst.answered || ff_fst.jlm_count == 0) return;
     buf[0] = 0;
     for (i = 0; i < ff_fst.jlm_count; i++) {
         char entry[32];
-        sprintf(entry, "%s%s (%04X)", i ? ", " : "", ff_fst.jlm[i].name, ff_fst.jlm[i].ddb_id);
-        strcat(buf, entry);
+        size_t elen;
+        snprintf(entry, sizeof(entry), "%s%s (%04X)", i ? ", " : "",
+                 ff_fst.jlm[i].name, ff_fst.jlm[i].ddb_id);
+        elen = strlen(entry);
+        if (pos + elen >= sizeof(buf)) {
+            if (pos + 5 < sizeof(buf)) {
+                memcpy(buf + pos, ", ...", 6);
+                pos += 5;
+            }
+            break;
+        }
+        memcpy(buf + pos, entry, elen + 1);
+        pos += elen;
     }
     ff_add("Modules", buf);
 }

@@ -140,29 +140,65 @@ _cpu_has_cpuid:
     and ax, 1
     retf
 
-; void xms_query_free_kb(unsigned int entry_off, unsigned int entry_seg,
-;                        unsigned int *total_kb, unsigned int *largest_kb)
+; int xms_query_free_kb(unsigned int entry_off, unsigned int entry_seg,
+;                       unsigned int *total_kb, unsigned int *largest_kb)
 ; Calls the XMS driver's entry point (handed out by INT 2Fh AX=4310h)
 ; with AH=08h, the query-free-memory function. The XMS ABI is a raw
 ; far call with register arguments, which no C calling convention can
 ; express, so the call is assembled here around a far pointer built
 ; on the stack from the two halves the caller passes in.
+; All registers the driver may clobber are saved/restored around the
+; call. Returns 1 on success (AX/DX non-zero, or BL=00h/A0h), 0 on error.
 ; Arguments: [bp+6]=off, [bp+8]=seg, [bp+10]=total (near ptr),
-; [bp+12]=largest (near ptr). XMS returns total in DX, largest in AX.
+; [bp+12]=largest (near ptr). XMS returns total in DX, largest in AX,
+; error code in BL.
 _xms_query_free_kb:
     push bp
     mov bp, sp
-    sub sp, 4
+    sub sp, 10
     mov ax, [bp+6]
     mov [bp-4], ax
     mov ax, [bp+8]
     mov [bp-2], ax
+    push bx
+    push cx
+    push si
+    push di
+    push es
+    push ds
+    xor bx, bx
     mov ah, 0x08
     call far [bp-4]
+    mov [bp-6], dx              ; total_kb
+    mov [bp-8], ax              ; largest_kb
+    mov [bp-10], bx             ; BL = XMS error code
+    pop ds
+    pop es
+    pop di
+    pop si
+    pop cx
     mov bx, [bp+10]
-    mov [bx], dx
-    mov bx, [bp+12]
+    mov ax, [bp-6]
     mov [bx], ax
+    mov bx, [bp+12]
+    mov ax, [bp-8]
+    mov [bx], ax
+    ; Succeed if either count is non-zero, or BL is 00h (no error) or
+    ; A0h (all extended memory is allocated, so 0 KB free is valid).
+    mov ax, [bp-6]
+    or ax, [bp-8]
+    jnz .xms_ok
+    mov ax, [bp-10]
+    test al, al
+    jz .xms_ok
+    cmp al, 0xA0
+    je .xms_ok
+    xor ax, ax
+    jmp .xms_done
+.xms_ok:
+    mov ax, 1
+.xms_done:
+    pop bx
     mov sp, bp
     pop bp
     retf
@@ -232,15 +268,17 @@ _ferric_api:
     pop bp
     retf
 
-; unsigned long pci_bios_present(unsigned int *ok)
+; unsigned long pci_bios_present(unsigned int *ok, unsigned char *last_bus)
 ; PCI BIOS installation check, INT 1Ah AX=B101h. Returns the EDX
-; signature value; *ok reports carry clear and AH=0. The 16-bit C
+; signature value; *ok reports carry clear and AH=0; *last_bus receives
+; CL (number of the last PCI bus in the system). The 16-bit C
 ; interrupt wrappers cannot move 32-bit registers, and the PCI BIOS
 ; speaks in them (EDX carries the ' PCI' signature), so the call is
 ; made here. 386 instructions appear below (push/pop of EDX halves),
 ; which is safe by construction: the caller gates on the CPU ladder,
 ; and a machine with a PCI BIOS is never older than a 386 anyway.
-; Argument: [bp+6] = ok (near pointer). Return: EDX in DX:AX.
+; Arguments: [bp+6] = ok (near ptr), [bp+8] = last_bus (near ptr).
+; Return: EDX in DX:AX.
 _pci_bios_present:
     push bp
     mov bp, sp
@@ -248,13 +286,17 @@ _pci_bios_present:
     push si
     push di
     mov ax, 0xB101
+    xor cx, cx
     int 0x1A
     mov si, [bp+6]
     mov word [si], 0
+    mov di, [bp+8]
+    mov byte [di], 0
     jc .done
     test ah, ah
     jnz .done
     mov word [si], 1
+    mov [di], cl
 .done:
     push edx                    ; split EDX into the DX:AX return
     pop ax

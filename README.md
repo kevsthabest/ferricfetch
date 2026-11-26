@@ -34,7 +34,8 @@ with sizes from INT 21h AH=36h and the FAT type from the Microsoft
 cluster-count rule (redirected drives are labelled "redirected"
 instead, via the IOCTL remote bit — the FAT rule cannot apply to
 them); EDD physical-disk sizes (INT 13h); uptime from the BIOS tick
-counter; date/time; country and codepage; COMSPEC shell (FreeCOM is
+counter; date/time; country and codepage; COMSPEC shell (4DOS and NDOS are positively identified via their
+INT 2Fh installation checks with version numbers; FreeCOM is
 identified by scanning the shell binary for its own name, a positive
 identification rather than an inference); USERNAME@COMPUTERNAME and
 EDITOR from the environment; resident programs by walking the MCB
@@ -95,22 +96,24 @@ a runtime gate that keeps them unreachable on older CPUs.
 ## Usage
 
 ```
-FFETCH [/NOLOGO] [/NOCLS] [/JSON] [/SAVE=<file>] [/LOGO=<file>]
-       [/C=<file>] [/MODULES=<a,b,c>] [/GENCFG] [/?
+FFETCH [/NOLOGO] [/NOCLS] [/NOCOLOR] [/JSON] [/SAVE=<file>]
+       [/LOGO=<file>] [/C=<file>] [/MODULES=<a,b,c>] [/GENCFG] [/?]
 ```
 
 - `FFETCH.CFG` beside the executable (or `/C=`) holds `key=value`
-  settings: `logo=<path>|none`, `nologo=1`, `cls=0|1`,
+  settings: `logo=<path>|none`, `nologo=1`, `cls=0|1`, `color=0|1`,
   `color_key=0-7`, `color_logo=0-7`, `modules=<list>`. `/GENCFG`
   writes a commented default. Command-line switches beat the file.
-- `/JSON` prints one JSON object (module names as keys), no logo, no
-  ANSI — safe to capture and parse.
+- `/JSON` prints one JSON object (module names as keys; repeated keys
+  such as multiple disks are emitted as arrays), no logo, no colour —
+  safe to capture and parse.
 - `/SAVE=<file>` also writes the plain-text rendering to a file.
-- When stdout is redirected to a file or pipe (checked via IOCTL),
-  colours and the logo are suppressed automatically: captured output
-  is plain text. ANSI colours are emitted only when an ANSI driver
-  answers INT 2Fh AX=1A00h, so a stock console never shows escape
-  garbage.
+- When stdout is redirected to a file, pipe, or serial port (checked
+  via IOCTL `ISDEV` + `ISCOT`), colours and the logo are suppressed
+  automatically: captured output is plain text. On a live DOS console,
+  ANSI colours are used when an ANSI driver answers INT 2Fh AX=1A00h,
+  and direct BIOS `INT 10h` colour attributes are used otherwise so
+  stock consoles and shells like 4DOS get colour without escape garbage.
 - Module names for `/MODULES=` and the config file: `title os kernel
   ferric host board bios cpu gpu display memory physmem disk
   physdisk sound network wifi modules battery power bootmgr shell
