@@ -20,6 +20,7 @@ segment _TEXT class=CODE
 global _cpu_family_ladder
 global _cpu_cpuid
 global _cpu_has_cpuid
+global _cpu_rdtsc
 global _xms_query_free_kb
 global _ferric_api
 global _pci_bios_present
@@ -138,6 +139,26 @@ _cpu_has_cpuid:
     xor eax, edx
     shr eax, 21
     and ax, 1
+    retf
+
+; void cpu_rdtsc(unsigned long *lo, unsigned long *hi)
+; Reads the 64-bit time-stamp counter (RDTSC, 0F 31). Only called
+; after cpu_family_ladder() >= 4, cpu_has_cpuid(), and CPUID leaf 1
+; EDX bit 4 (TSC) is confirmed set, so older CPUs never execute it.
+; Medium-model far call: [bp+6]=lo (near ptr), [bp+8]=hi (near ptr).
+_cpu_rdtsc:
+    push bp
+    mov bp, sp
+    push bx
+    push edx
+    rdtsc
+    mov bx, [bp+6]
+    mov [bx], eax
+    mov bx, [bp+8]
+    mov [bx], edx
+    pop edx
+    pop bx
+    pop bp
     retf
 
 ; int xms_query_free_kb(unsigned int entry_off, unsigned int entry_seg,

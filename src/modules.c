@@ -22,6 +22,7 @@
 unsigned short __cdecl cpu_family_ladder(void);
 unsigned short __cdecl cpu_has_cpuid(void);
 void __cdecl cpu_cpuid(unsigned long leaf, unsigned long __far *regs);
+void __cdecl cpu_rdtsc(unsigned long *lo, unsigned long *hi);
 int __cdecl xms_query_free_kb(unsigned int entry_off, unsigned int entry_seg,
                        unsigned int *total_kb, unsigned int *largest_kb);
 
@@ -144,6 +145,46 @@ void mod_kernel(void)
 /* CPU                                                               */
 /* ---------------------------------------------------------------- */
 
+/* Measure live effective CPU clock in MHz by calibrating RDTSC against
+ * two BIOS timer ticks (0040:006C, 18.2065 Hz -> ~109.851 ms). Uses
+ * memory reads only (no PIT port writes, so it never disturbs sound
+ * drivers or V86 port traps). On Pentium/PII/PIII/K6/Athlon/Pentium-M
+ * hardware, RDTSC tracks actual core cycles, so SpeedStep and ACPI
+ * throttling show up directly as the lower MHz. */
+static unsigned long cpu_measure_mhz(void)
+{
+    unsigned long lo0, hi0, lo1, hi1, dlo, dhi;
+    unsigned long t_start, t_cur;
+    unsigned long guard;
+    int ticks;
+
+    t_start = peekd(0x40, 0x6C);
+    t_cur = t_start;
+    for (guard = 0; guard < 20000000UL; guard++) {
+        t_cur = peekd(0x40, 0x6C);
+        if (t_cur != t_start) break;
+    }
+    if (t_cur == t_start) return 0;
+
+    cpu_rdtsc(&lo0, &hi0);
+    t_start = t_cur;
+
+    for (ticks = 0; ticks < 2; ticks++) {
+        for (guard = 0; guard < 20000000UL; guard++) {
+            t_cur = peekd(0x40, 0x6C);
+            if (t_cur != t_start) break;
+        }
+        if (t_cur == t_start) return 0;
+        t_start = t_cur;
+    }
+
+    cpu_rdtsc(&lo1, &hi1);
+    dlo = lo1 - lo0;
+    dhi = hi1 - hi0 - (lo1 < lo0 ? 1UL : 0UL);
+    if (dhi != 0) return 0;
+    return (dlo + 54925UL) / 109851UL;
+}
+
 void mod_cpu(void)
 {
     char buf[FF_VAL_MAX];
@@ -153,9 +194,10 @@ void mod_cpu(void)
         unsigned long max_leaf, max_ext;
         char vendor[13];
         char brand[49];
-        unsigned long eax1;
+        unsigned long eax1 = 0, edx1 = 0;
+        unsigned long mhz = 0;
         unsigned int efam, emod, f, m;
-        int i, have_brand = 0;
+        int have_brand = 0;
         cpu_cpuid(0, r);
         max_leaf = r[0];
         memcpy(vendor + 0, &r[1], 4);
@@ -172,31 +214,49 @@ void mod_cpu(void)
             cpu_cpuid(0x80000004UL, b + 8);
             memcpy(brand, b, 48);
             brand[48] = 0;
-            /* Brand strings are space-padded; trim both ends so the
-             * line does not carry the padding into the summary. */
+            /* Brand strings often have leading/trailing spaces and
+             * internal runs of spaces (e.g. "CPU       750MHz"); trim
+             * both ends and collapse runs so the line fits cleanly. */
             {
-                char *s = brand;
-                while (*s == ' ') s++;
-                if (s != brand) memmove(brand, s, strlen(s) + 1);
-                i = (int)strlen(brand);
-                while (i > 0 && brand[i-1] == ' ') brand[--i] = 0;
+                char *src = brand, *dst = brand;
+                int in_sp = 0;
+                while (*src == ' ') src++;
+                while (*src) {
+                    if (*src == ' ') {
+                        if (!in_sp) { *dst++ = ' '; in_sp = 1; }
+                    } else {
+                        *dst++ = *src;
+                        in_sp = 0;
+                    }
+                    src++;
+                }
+                while (dst > brand && dst[-1] == ' ') dst--;
+                *dst = 0;
             }
             have_brand = brand[0] != 0;
         }
         if (max_leaf >= 1) {
             cpu_cpuid(1, r);
             eax1 = r[0];
-        } else eax1 = 0;
+            edx1 = r[3];
+        }
+        if (edx1 & 0x10UL) {
+            unsigned long measured = cpu_measure_mhz();
+            if (measured >= 1UL && measured <= 20000UL) mhz = measured;
+        }
         f = (unsigned int)((eax1 >> 8) & 0xF);
         m = (unsigned int)((eax1 >> 4) & 0xF);
         efam = (unsigned int)((eax1 >> 20) & 0xFF);
         emod = (unsigned int)((eax1 >> 16) & 0xF);
         if (f == 0xF) f += efam;
         if (f == 0x6 || f == 0xF) m += (emod << 4);
-        if (have_brand)
-            sprintf(buf, "%s", brand);
-        else
-            sprintf(buf, "%s family %u model %u", vendor, f, m);
+        if (have_brand) {
+            if (mhz) snprintf(buf, sizeof(buf), "%s (@ %lu MHz)", brand, mhz);
+            else snprintf(buf, sizeof(buf), "%s", brand);
+        } else {
+            if (mhz) snprintf(buf, sizeof(buf), "%s family %u model %u (@ %lu MHz)", vendor, f, m, mhz);
+            else snprintf(buf, sizeof(buf), "%s family %u model %u", vendor, f, m);
+        }
         ff_add("CPU", buf);
         return;
     }

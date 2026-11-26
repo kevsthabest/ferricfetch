@@ -372,35 +372,113 @@ static void render_palette_bar(FILE *out)
     }
 }
 
+static int probe_screen_cols(void)
+{
+    union REGS r;
+    r.h.ah = 0x0F;
+    int86(0x10, &r, &r);
+    return r.h.ah ? (int)r.h.ah : 80;
+}
+
+static void emit_plain_n(FILE *out, const char *s, int n)
+{
+    if (ff_cfg.use_bios_color) {
+        while (n-- > 0 && *s) bios_putc_attr(*s++, 0x07);
+    } else {
+        fprintf(out, "%.*s", n, s);
+    }
+}
+
+static void emit_newline(FILE *out)
+{
+    if (ff_cfg.use_bios_color) bios_puts_attr("\r\n", 0x07);
+    else fprintf(out, "\r\n");
+}
+
+/* Choose how many characters of `p` fit within `limit`, breaking at a
+ * space when possible so words and MAC addresses stay intact. */
+static int wrap_chunk_len(const char *p, int limit)
+{
+    int len = (int)strlen(p);
+    int k;
+    if (limit <= 0) return 0;
+    if (len <= limit) return len;
+    for (k = limit; k > 0; k--) {
+        if (p[k] == ' ') return k;
+    }
+    return limit;
+}
+
 static void render_pretty(FILE *out)
 {
-    int rows, i;
+    int i, screen_row = 0;
     int use_logo = ff_cfg.show_logo && ff_cfg.stdout_is_console && !ff_cfg.json;
+    int max_col = 0, left_w = 0, avail = 0;
     if (use_logo) logo_load(); else ff_logo_n = 0;
     if (ff_cfg.use_bios_color) {
         fflush(out);
         bios_init_page();
     }
-    rows = ff_nlines > ff_logo_n ? ff_nlines : ff_logo_n;
-    for (i = 0; i < rows; i++) {
-        if (ff_logo_n > 0) {
-            const char *art = i < ff_logo_n ? ff_logo_store[i] : "";
-            render_logo_line(out, i, art);
+    if (ff_cfg.stdout_is_console) {
+        int cols = probe_screen_cols();
+        /* Keep 1 column of margin so writing to the rightmost cell
+         * never triggers an automatic BIOS wrap + stray blank line. */
+        max_col = cols > 1 ? cols - 1 : 79;
+        if (ff_logo_n > 0 && max_col - (ff_logo_w + 2) < 20) {
+            ff_logo_n = 0;
         }
-        if (i < ff_nlines) {
-            if (ff_cfg.use_bios_color) {
-                bios_puts_attr(ff_lines[i].key, ansi_to_bios_fg(ff_cfg.color_key));
-                bios_puts_attr(": ", 0x07);
-                bios_puts_attr(ff_lines[i].value, 0x07);
-            } else {
-                if (ff_cfg.use_ansi) emit_ansi_color(out, ff_cfg.color_key);
-                fprintf(out, "%s", ff_lines[i].key);
-                if (ff_cfg.use_ansi) fprintf(out, "\x1b[0m");
-                fprintf(out, ": %s", ff_lines[i].value);
-            }
+        left_w = ff_logo_n > 0 ? ff_logo_w + 2 : 0;
+        avail = max_col - left_w;
+    }
+    for (i = 0; i < ff_nlines; i++) {
+        if (!ff_cfg.stdout_is_console) {
+            fprintf(out, "%s: %s\r\n", ff_lines[i].key, ff_lines[i].value);
+            continue;
         }
-        if (ff_cfg.use_bios_color) bios_puts_attr("\r\n", 0x07);
-        else fprintf(out, "\r\n");
+        {
+            const char *p = ff_lines[i].value;
+            int klen = (int)strlen(ff_lines[i].key);
+            int first = 1;
+            do {
+                if (ff_logo_n > 0) {
+                    const char *art = screen_row < ff_logo_n ? ff_logo_store[screen_row] : "";
+                    render_logo_line(out, screen_row, art);
+                }
+                if (first) {
+                    int limit = avail - (klen + 2);
+                    if (ff_cfg.use_bios_color) {
+                        bios_puts_attr(ff_lines[i].key, ansi_to_bios_fg(ff_cfg.color_key));
+                        bios_puts_attr(": ", 0x07);
+                    } else {
+                        if (ff_cfg.use_ansi) emit_ansi_color(out, ff_cfg.color_key);
+                        fprintf(out, "%s", ff_lines[i].key);
+                        if (ff_cfg.use_ansi) fprintf(out, "\x1b[0m");
+                        fprintf(out, ": ");
+                    }
+                    if (limit > 0) {
+                        int n = wrap_chunk_len(p, limit);
+                        emit_plain_n(out, p, n);
+                        p += n;
+                        while (*p == ' ') p++;
+                    }
+                    first = 0;
+                } else {
+                    int limit = avail > 2 ? avail - 2 : 1;
+                    int n = wrap_chunk_len(p, limit);
+                    emit_plain_n(out, "  ", 2);
+                    emit_plain_n(out, p, n);
+                    p += n;
+                    while (*p == ' ') p++;
+                }
+                emit_newline(out);
+                screen_row++;
+            } while (*p);
+        }
+    }
+    while (screen_row < ff_logo_n) {
+        render_logo_line(out, screen_row, ff_logo_store[screen_row]);
+        emit_newline(out);
+        screen_row++;
     }
     render_palette_bar(out);
 }
